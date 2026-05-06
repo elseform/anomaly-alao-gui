@@ -146,6 +146,14 @@ class ASTTransformer:
             self._edit_string_len(finding)
         elif pattern == 'math_pow_simple':
             self._edit_math_pow(finding)
+        elif pattern == 'pow_op_simple':
+            self._edit_pow_op_simple(finding)
+        elif pattern == 'string_literal_concat':
+            self._edit_string_literal_concat(finding)
+        elif pattern == 'string_find_plain':
+            self._edit_string_find_plain(finding)
+        elif pattern == 'redundant_not_eq':
+            self._edit_redundant_not_eq(finding)
         elif pattern == 'debug_statement':
             self._edit_debug_statement(finding)
         elif pattern == 'uncached_globals_summary':
@@ -353,9 +361,16 @@ class ASTTransformer:
             return
 
         if pow_type == 'sqrt':
+            # `^` already binds tighter than every surrounding operator we
+            # would replace into, so no parens needed.
             replacement = f'{base}^0.5'
         elif pow_type == 'power' and isinstance(exp, int):
-            replacement = '*'.join([base] * exp)
+            # Wrap multi-MUL replacement in parens: the original `math.pow(x,2)`
+            # is a single primary expression, but `x*x` introduces a binary
+            # operator. Without parens, surroundings like `1/math.pow(x,2)`
+            # would silently rewrite to `1/x*x` ((1/x)*x - wrong) instead of
+            # `1/(x*x)`.
+            replacement = '(' + '*'.join([base] * exp) + ')'
         else:
             return
 
@@ -363,6 +378,121 @@ class ASTTransformer:
             start_char=start,
             end_char=end,
             replacement=replacement,
+        ))
+
+    def _edit_string_literal_concat(self, finding: Finding):
+        """Replace an all-literal Concat tree with the folded string literal."""
+        node = finding.details.get('node')
+        combined = finding.details.get('combined')
+        if not node or not combined:
+            return
+        start, end = self._get_node_span(node)
+        if start is None:
+            return
+        self.edits.append(SourceEdit(
+            start_char=start,
+            end_char=end,
+            replacement=combined,
+        ))
+
+    def _edit_string_find_plain(self, finding: Finding):
+        """Add the plain-search flag to `string.find` with a plain-text needle.
+
+        2-arg form: `string.find(s, "x")`        -> insert `, 1, true`
+        3-arg form: `string.find(s, "x", N)`     -> insert `, true`
+
+        The insertion goes right after the last argument's source span.
+        We can't rely on the Call's `last_token` being the closing paren -
+        when the call expression is wrapped in extra parens (e.g. inside
+        an `if (foo(x))` test) luaparser's last_token is the outer `)`,
+        and inserting there lands the new args OUTSIDE the call.
+        """
+        node = finding.details.get('node')
+        n_args = finding.details.get('n_args')
+        if not node or n_args not in (2, 3):
+            return
+
+        # Use the last argument's end position as the insertion point.
+        args = getattr(node, 'args', None) or []
+        if not args:
+            return
+        last_arg = args[-1]
+        _, arg_end = self._get_node_span(last_arg)
+        if arg_end is None or arg_end <= 0 or arg_end > len(self.source):
+            return
+
+        addition = ', 1, true' if n_args == 2 else ', true'
+        self.edits.append(SourceEdit(
+            start_char=arg_end,
+            end_char=arg_end,
+            replacement=addition,
+        ))
+
+    def _edit_redundant_not_eq(self, finding: Finding):
+        """Rewrite `not (a == b)` to `a ~= b` (and the dual).
+
+        We replace the entire ULNotOp source span with `<L> <newop> <R>`,
+        using the original source text for L and R (so any user-chosen
+        parenthesization or whitespace within the operands is preserved).
+
+        Edge case: if the ULNotOp's source span starts with `(`, that means
+        the ULNotOp was syntactically wrapped in parens by an enclosing
+        context (e.g. inside another `not (...)`). Stripping those parens
+        in the rewrite would change precedence - `not (not (a == b))` would
+        end up as `not a ~= b`, parsed as `(not a) ~= b`. Detect that case
+        and re-wrap the replacement in parens.
+        """
+        outer = finding.details.get('outer_node')
+        left = finding.details.get('left_node')
+        right = finding.details.get('right_node')
+        new_op = finding.details.get('new_op')
+        if outer is None or left is None or right is None or not new_op:
+            return
+
+        outer_start, outer_end = self._get_node_span(outer)
+        left_start, left_end = self._get_node_span(left)
+        right_start, right_end = self._get_node_span(right)
+        if (outer_start is None or outer_end is None or
+                left_start is None or left_end is None or
+                right_start is None or right_end is None):
+            return
+
+        left_text = self.source[left_start:left_end]
+        right_text = self.source[right_start:right_end]
+        replacement = f'{left_text} {new_op} {right_text}'
+
+        # If the rewritten span begins with `(` rather than `not`, the parens
+        # belong to whatever wraps us - keep them in the replacement.
+        first_tok = getattr(outer, 'first_token', None)
+        if first_tok is not None and "='('" in str(first_tok):
+            replacement = f'({replacement})'
+
+        self.edits.append(SourceEdit(
+            start_char=outer_start,
+            end_char=outer_end,
+            replacement=replacement,
+        ))
+
+    def _edit_pow_op_simple(self, finding: Finding):
+        """Convert `x ^ 2` / `x ^ 3` to `(x*x)` / `(x*x*x)`.
+
+        Same precedence concern as _edit_math_pow: wrap in parens so that
+        `1 / x^2` and `-x^2` keep meaning `1/(x*x)` and `-(x*x)` after the
+        rewrite. Strictly speaking `-x^2` rewrites to `-(x*x)` which equals
+        `-x*x` either way (unary minus has lower precedence than `*`), but
+        the universal rule is simpler and never wrong.
+        """
+        node = finding.details.get('node')
+        replacement = finding.details.get('replacement')
+        if not node or not replacement:
+            return
+        start, end = self._get_node_span(node)
+        if start is None:
+            return
+        self.edits.append(SourceEdit(
+            start_char=start,
+            end_char=end,
+            replacement=f'({replacement})',
         ))
 
     def _edit_distance_to_comparison(self, finding: Finding):
@@ -1037,6 +1167,10 @@ class ASTTransformer:
         if not globals_info or not scope:
             return
 
+        # collect existing locals so we don't shadow a user-defined name
+        # (e.g. user already has `local mfloor = ...` somewhere in this function)
+        existing_locals = self._collect_function_locals(scope)
+
         # build cache declarations and track replacements
         cache_lines = []
         replacements: Dict[str, str] = {}
@@ -1044,13 +1178,16 @@ class ASTTransformer:
         for name in sorted(globals_info.keys()):
             # use idiomatic name if available, otherwise generate one
             if name in self.IDIOMATIC_CACHE_NAMES:
-                cache_name = self.IDIOMATIC_CACHE_NAMES[name]
+                base_cache_name = self.IDIOMATIC_CACHE_NAMES[name]
             elif '.' in name:
                 module, func = name.split('.', 1)
                 # use first letter of module + func name
-                cache_name = f'{module[0]}{func}'
+                base_cache_name = f'{module[0]}{func}'
             else:
-                cache_name = f'g_{name}'
+                base_cache_name = f'g_{name}'
+
+            cache_name = self._resolve_cache_name(base_cache_name, existing_locals)
+            existing_locals.add(cache_name)  # avoid colliding with our other inserts
 
             cache_lines.append(f'local {cache_name} = {name}')
             replacements[name] = cache_name
@@ -1240,11 +1377,11 @@ class ASTTransformer:
         else:
             return
 
-        # pattern to detect exact cache declaration (local obj =, not local obj1 =)
-        cache_decl_pattern = rf'\blocal\s+{re.escape(new_name)}\s*='
-
         # check if first call is already a cache declaration for THIS pattern
         # i.e., "local obj = level.object_by_id(...)" where obj is the cache var
+        # NB: this check uses the ORIGINAL new_name, so a pre-existing cache
+        # is recognised even if a separate local would have forced a rename.
+        original_cache_decl_pattern = rf'\blocal\s+{re.escape(new_name)}\s*='
         first_call = calls[0]
         first_line_start, first_line_end = self._get_line_span(first_call.line)
         is_already_cached = False
@@ -1252,9 +1389,31 @@ class ASTTransformer:
 
         if first_line_start is not None:
             first_line = self.source[first_line_start:first_line_end]
-            if re.search(cache_decl_pattern, first_line) and call_pattern_re.search(first_line):
+            if re.search(original_cache_decl_pattern, first_line) and call_pattern_re.search(first_line):
                 is_already_cached = True
                 cache_indent = self._get_indent_at_line(first_call.line)
+
+        # Collision check: if we're going to INSERT a new local but the chosen
+        # name already exists somewhere in the function (param, sibling local,
+        # nested local), pick an alternative so we don't shadow user code.
+        if not is_already_cached:
+            existing_locals = self._collect_function_locals(scope)
+            resolved = self._resolve_cache_name(new_name, existing_locals)
+            if resolved != new_name:
+                # rebuild cache_line with the renamed identifier; the call_pattern
+                # itself describes the source expression (db.actor / obj:id()),
+                # which is unaffected by the rename.
+                cache_line = cache_line.replace(
+                    f'local {new_name} ',
+                    f'local {resolved} ',
+                    1,
+                )
+                new_name = resolved
+
+        # cache_decl_pattern is rebuilt with the possibly-renamed identifier;
+        # downstream code uses it only to skip-over the cache decl line itself
+        # when applying replacements.
+        cache_decl_pattern = rf'\blocal\s+{re.escape(new_name)}\s*='
 
         # insert cache if not already present
         if not is_already_cached:
@@ -1542,16 +1701,28 @@ class ASTTransformer:
                     # find end of identifier
                     end_of_name = pos + 1
                     # find start of identifier
+                    id_end = pos  # position of last identifier char (or last non-ident)
                     while pos >= 0 and (self.source[pos].isalnum() or self.source[pos] == '_'):
                         pos -= 1
+                    found_identifier = pos != id_end
                     start = pos + 1
 
                     # end is the closing paren
                     last = getattr(node, 'last_token', None)
                     end = self._parse_token_end(str(last)) if last else None
 
-                    if start is not None and end is not None:
+                    if found_identifier and start is not None and end is not None:
                         return start, end
+
+                    # No identifier before the paren - this is a wrapping
+                    # paren (e.g. `if (foo(x))`). Return the span of the
+                    # whole wrap so callers replace it consistently. Using
+                    # the Index path's `value.first_token` would start
+                    # mid-wrap (`math` of `(math.pow(...))`) but the end
+                    # would still be the outer `)`, leaving an unmatched
+                    # bracket after replacement.
+                    if not found_identifier and end is not None:
+                        return paren_start, end
 
             if isinstance(func, Index):
                 # get the start from the base value
@@ -1585,6 +1756,51 @@ class ASTTransformer:
                 end = self._parse_token_end(str(last)) if last else None
 
                 return start, end
+
+        # Index nodes (e.g. `db.actor`, `self.args.mode`) - `first_token` is
+        # sometimes the base identifier (`db`), sometimes the dot, depending
+        # on parsing context. For nested chains like `self.args.mode`, the
+        # outer Index's value IS another Index whose first_token may be the
+        # `.` between `self` and `args`. We must reach all the way back to
+        # the chain's *base* identifier, recursing into nested Indexes.
+        if isinstance(node, Index):
+            value = getattr(node, 'value', None)
+            start = None
+            if value is not None:
+                if isinstance(value, Index):
+                    # recursive: the inner Index has the same start
+                    # determination concern. Reuse the helper to walk
+                    # all the way down to the base name.
+                    v_start, _ = self._get_node_span(value)
+                    if v_start is not None:
+                        start = v_start
+                else:
+                    value_first = getattr(value, 'first_token', None)
+                    if value_first and str(value_first) != 'None':
+                        start = self._parse_token_start(str(value_first))
+            if start is None:
+                first_tok = getattr(node, 'first_token', None)
+                if first_tok and str(first_tok) != 'None':
+                    first_str = str(first_tok)
+                    first_pos = self._parse_token_start(first_str)
+                    # Token-string format: "[@idx,start:end='text',type,line:col]".
+                    # Detect a dot token by its quoted text payload.
+                    is_dot_token = "='.'" in first_str
+                    if first_pos is not None:
+                        if is_dot_token and first_pos > 0:
+                            pos = first_pos - 1
+                            while pos >= 0 and self.source[pos] in ' \t':
+                                pos -= 1
+                            while pos >= 0 and (self.source[pos].isalnum() or self.source[pos] == '_'):
+                                pos -= 1
+                            start = pos + 1
+                        else:
+                            # first_token IS the base name - use it directly
+                            start = first_pos
+
+            last = getattr(node, 'last_token', None)
+            end = self._parse_token_end(str(last)) if last and str(last) != 'None' else None
+            return start, end
 
         # default: use first/last tokens directly
         first = getattr(node, 'first_token', None)
@@ -1744,6 +1960,56 @@ class ASTTransformer:
         stripped = line.lstrip()
         return line[:len(line) - len(stripped)]
 
+    def _collect_function_locals(self, func_scope) -> Set[str]:
+        """Return every local name visible anywhere inside `func_scope`'s body.
+
+        Includes the function's own scope and every descendant scope (loop /
+        block / nested function bodies). Used to avoid colliding with a cache
+        name we are about to introduce - declaring `local mfloor = math.floor`
+        on top of a user-written `local mfloor = ...` would silently shadow it.
+        """
+        if func_scope is None or self.analyzer is None:
+            return set()
+
+        target_id = id(func_scope)
+        descendant_ids = {target_id}
+
+        # walk every recorded scope; if any ancestor is func_scope, it's a descendant
+        for s in self.analyzer.scopes:
+            if id(s) == target_id:
+                continue
+            anc = s.parent
+            while anc is not None:
+                if id(anc) == target_id:
+                    descendant_ids.add(id(s))
+                    break
+                anc = anc.parent
+
+        names: Set[str] = set()
+        for s in self.analyzer.scopes:
+            if id(s) in descendant_ids:
+                names.update(s.locals)
+        return names
+
+    @staticmethod
+    def _resolve_cache_name(base_name: str, taken: Set[str]) -> str:
+        """Pick an unused identifier based on `base_name`, avoiding `taken`.
+
+        On conflict appends `_alao`, then `_alao2`, `_alao3`... - keeps the
+        suggestion legible while guaranteeing uniqueness.
+        """
+        if base_name not in taken:
+            return base_name
+        candidate = f"{base_name}_alao"
+        if candidate not in taken:
+            return candidate
+        i = 2
+        while True:
+            candidate = f"{base_name}_alao{i}"
+            if candidate not in taken:
+                return candidate
+            i += 1
+
     def _detect_indent_unit(self) -> str:
         """Detect the file's indent style (tab or N spaces). Cached per transform."""
         if hasattr(self, '_cached_indent_unit'):
@@ -1788,56 +2054,74 @@ class ASTTransformer:
         return self._cached_indent_unit
 
     def _apply_edits(self) -> str:
-        """Apply all edits and return new source."""
+        """Apply all edits and return new source.
+
+        Two-pass filter:
+          (1) admit non-overlapping replacements (priority desc, start desc)
+          (2) admit insertions whose position is *outside* every admitted
+              replacement's span. Insertions inside a replacement would be
+              lost - when the replacement is later applied end-to-start its
+              new text overwrites the inserted bytes - so we drop them.
+
+        Then apply admitted edits end-to-start so positions don't shift.
+        """
         if not self.edits:
             return self.source
 
         from bisect import bisect_left, bisect_right
 
-        # sort by priority descending, then position descending
-        self.edits.sort(key=lambda e: (-e.priority, -e.start_char))
+        replacements = [e for e in self.edits if e.start_char != e.end_char]
+        insertions = [e for e in self.edits if e.start_char == e.end_char]
 
-        filtered = []
-        # sorted list of (start, end) for accepted non-insertion edits
+        # Pass 1: replacements - same overlap rules as before.
+        replacements.sort(key=lambda e: (-e.priority, -e.start_char))
+        admitted_repl = []
         covered_starts: List[int] = []
         covered_ends: List[int] = []
-        seen_insertions: set = set()
-
-        for edit in self.edits:
-            # check for duplicate insertions at same position
-            if edit.start_char == edit.end_char:
-                insertion_key = (edit.start_char, edit.replacement)
-                if insertion_key in seen_insertions:
-                    continue
-                seen_insertions.add(insertion_key)
-            
-            # check overlap against sorted non-overlapping accepted ranges
+        for edit in replacements:
+            s, e = edit.start_char, edit.end_char
             overlaps = False
             if covered_starts:
-                s, e = edit.start_char, edit.end_char
-                # check interval whose start is largest <= s
                 i = bisect_right(covered_starts, s) - 1
                 if i >= 0 and covered_ends[i] > s:
                     overlaps = True
-                # check interval whose start is smallest >= s  
                 if not overlaps:
                     j = bisect_left(covered_starts, s)
                     if j < len(covered_starts) and covered_starts[j] < e:
                         overlaps = True
-
             if not overlaps:
-                filtered.append(edit)
-                if edit.start_char != edit.end_char:
-                    # insert into sorted position
-                    idx = bisect_left(covered_starts, edit.start_char)
-                    covered_starts.insert(idx, edit.start_char)
-                    covered_ends.insert(idx, edit.end_char)
+                admitted_repl.append(edit)
+                idx = bisect_left(covered_starts, edit.start_char)
+                covered_starts.insert(idx, edit.start_char)
+                covered_ends.insert(idx, edit.end_char)
 
-        # apply edits from end to start (so positions don't shift)
+        # Pass 2: insertions - dedupe by (pos, text), then drop any whose
+        # position is inside an admitted replacement's span. Allow insertion
+        # at the boundary (s == replacement.start) because that lands at the
+        # leading edge before the replacement text.
+        insertions.sort(key=lambda e: (-e.priority, -e.start_char))
+        admitted_ins = []
+        seen_insertions: set = set()
+        for edit in insertions:
+            key = (edit.start_char, edit.replacement)
+            if key in seen_insertions:
+                continue
+            seen_insertions.add(key)
+            s = edit.start_char
+            inside_replacement = False
+            if covered_starts:
+                i = bisect_right(covered_starts, s) - 1
+                if i >= 0 and covered_starts[i] <= s < covered_ends[i]:
+                    inside_replacement = True
+            if not inside_replacement:
+                admitted_ins.append(edit)
+
+        # Apply end-to-start so earlier positions stay valid.
+        admitted = admitted_repl + admitted_ins
+        admitted.sort(key=lambda e: -e.start_char)
         result = self.source
-        for edit in sorted(filtered, key=lambda e: -e.start_char):
+        for edit in admitted:
             result = result[:edit.start_char] + edit.replacement + result[edit.end_char:]
-
         return result
 
 

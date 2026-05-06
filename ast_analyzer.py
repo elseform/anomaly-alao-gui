@@ -95,6 +95,13 @@ DIRECT_REPLACEMENT_FUNCS = frozenset({
     'table.insert', 'table.getn', 'string.len',
 })
 
+# Index-style accesses that are worth caching when repeated (property reads,
+# not function calls). `db.actor` and `db.storage` are property accesses that
+# resolve through metatable lookups in the engine - caching the reference in
+# a local once is a real win in hot code. The repeated-call analysis treats
+# entries here equivalently to function calls in expensive_calls
+EXPENSIVE_INDEXES = frozenset({'db.actor'})
+
 # Functions/properties that can return nil - calling methods on these without
 # nil checks can cause CTD (crash to desktop)
 # Format: full_name -> description of when it returns nil
@@ -218,7 +225,13 @@ class Scope:
 
 @dataclass
 class CallInfo:
-    """Information about a function call."""
+    """Information about a function call.
+
+    `if_chain_path` is the sequence of (if_id, branch_index) tuples - one per
+    enclosing if-chain - that must all be entered to reach this call. It
+    powers nested branch-aware counting. An empty tuple means the call runs
+    unconditionally (within whatever function/loop scope it lives in).
+    """
     full_name: str          # "table.insert", "db.actor", "pairs"
     module: Optional[str]   # "table", "db", None
     func: str               # "insert", "actor", "pairs"
@@ -228,8 +241,27 @@ class CallInfo:
     scope: Scope
     in_loop: bool = False
     loop_depth: int = 0
-    parent_if_node: Optional[Node] = None  # which If statement contains this call
-    branch_index: int = -1  # 0=main if, 1=elseif[0], 2=elseif[1], etc., -1=else or not in if
+    if_chain_path: Tuple[Tuple[int, int], ...] = ()
+
+
+@dataclass
+class IndexInfo:
+    """Information about a property access (e.g. `db.actor`).
+
+    Mirrors CallInfo enough that _analyze_repeated_calls_in_scope and
+    _edit_repeated_calls can iterate either kind through the same code paths.
+    Only single-level dot-access is recorded (Index(Name, Name)) - that's the
+    only shape we know how to safely cache as `local x = base.field`.
+    """
+    full_name: str          # "db.actor"
+    module: str             # "db"
+    func: str               # "actor"  (named `func` for duck-compat with CallInfo)
+    line: int
+    node: Node
+    scope: Scope
+    in_loop: bool = False
+    loop_depth: int = 0
+    if_chain_path: Tuple[Tuple[int, int], ...] = ()
 
 
 @dataclass
@@ -358,6 +390,11 @@ class ASTAnalyzer:
         self.current_scope: Optional[Scope] = None
         self.global_scope: Optional[Scope] = None
         self.calls: List[CallInfo] = []
+        self.indexes: List[IndexInfo] = []
+        # Index nodes that are the callee of a Call/Invoke - they should NOT
+        # be recorded as standalone property reads (the corresponding Call /
+        # Invoke already accounts for them).
+        self._suppress_indexes: Set[int] = set()
         self.assigns: List[AssignInfo] = []
         self.concats: List[ConcatInfo] = []
         self.global_writes: List[Tuple[str, int]] = []
@@ -381,15 +418,20 @@ class ASTAnalyzer:
 
         self.loop_depth: int = 0
         self.function_depth: int = 0
-        
-        self.current_if_chain: Optional[Node] = None
-        self.current_branch_index: int = -1
+
+        # Stack of (if_id, branch_index) ancestors. Pushed when we enter a
+        # branch body, popped when we leave. Calls/indexes record a snapshot
+        # of this stack so _count_calls_branch_aware can walk the nested
+        # if-chain tree and compute the true max-coexisting-call count.
+        self.if_chain_stack: List[Tuple[int, int]] = []
+
+        # cleared per-run so a re-used analyzer can't see a stale tree
+        self._ast_tree: Optional[Node] = None
 
     def analyze_file(self, file_path: Path) -> List[Finding]:
         """Analyze a Lua file and return findings."""
         self.reset()
         self.file_path = file_path
-        self._ast_tree = None
 
         try:
             encoding = detect_file_encoding(file_path)
@@ -936,51 +978,85 @@ class ASTAnalyzer:
         self.loop_depth -= 1
 
     def _visit_If(self, node: If):
-        """Handle if statement."""
-        # save previous if-chain context
-        prev_if_chain = self.current_if_chain
-        prev_branch_index = self.current_branch_index
-        
-        # set this as current if-chain
-        self.current_if_chain = node
-        
-        # visit test condition
+        """Handle if statement.
+
+        In Lua every if/elseif/else body is its own scope, so we open a fresh
+        block scope around each. Without this, a `local x = ...` inside an
+        if-body bleeds into the enclosing function's locals tracking and can
+        clobber nil-source tracking when the same name is reassigned in
+        another branch - see C2 in the audit notes.
+        """
+        if_id = id(node)
+
+        # test runs in the parent scope (it can read outer locals but
+        # `local`s declared inside it would still belong to the parent).
+        # The test is also OUTSIDE this if-chain's branches in the
+        # if_chain_stack sense - so we don't push for the test.
         self._visit(node.test)
-        
-        # visit main if body (branch 0)
-        self.current_branch_index = 0
+
+        # main body - branch 0, fresh block scope, push onto chain stack
+        body_line = self._get_line(node.body) if node.body is not None else self._get_line(node)
+        body_end = self._get_end_line(node.body) if node.body is not None else self._get_end_line(node)
+        self.if_chain_stack.append((if_id, 0))
+        self._enter_scope('<if-body>', body_line, 'block')
         self._visit(node.body)
-        
-        # visit elseif/else chain
+        self._exit_scope(body_end)
+        self.if_chain_stack.pop()
+
+        # elseif/else chain - keeps the same if_id, increments branch index
         if node.orelse:
-            self._visit_orelse(node.orelse, 1)
-        
-        # restore previous context
-        self.current_if_chain = prev_if_chain
-        self.current_branch_index = prev_branch_index
-    
-    def _visit_orelse(self, node, branch_idx):
-        """Helper to visit elseif/else with branch tracking."""
+            self._visit_orelse(node.orelse, if_id, 1)
+
+    def _visit_orelse(self, node, if_id, branch_idx):
+        """Helper to visit elseif/else with branch + scope tracking."""
         if isinstance(node, ElseIf):
-            # elseif branch
-            self.current_branch_index = branch_idx
+            # elseif: test and body share a scope (elseif test only runs after
+            # all prior branches have failed, so it's effectively in the same
+            # control-flow position as the body that follows it).
+            line = self._get_line(node)
+            end = self._get_end_line(node)
+            self.if_chain_stack.append((if_id, branch_idx))
+            self._enter_scope('<elseif-body>', line, 'block')
             self._visit(node.test)
             self._visit(node.body)
+            self._exit_scope(end)
+            self.if_chain_stack.pop()
+
             if node.orelse:
-                self._visit_orelse(node.orelse, branch_idx + 1)
+                self._visit_orelse(node.orelse, if_id, branch_idx + 1)
         elif isinstance(node, Block):
-            # else block
-            self.current_branch_index = -1  # -1 for else
+            # else block - branch index -1
+            line = self._get_line(node)
+            end = self._get_end_line(node)
+            self.if_chain_stack.append((if_id, -1))
+            self._enter_scope('<else-body>', line, 'block')
             self._visit(node)
+            self._exit_scope(end)
+            self.if_chain_stack.pop()
         else:
-            # fallback
-            self.current_branch_index = -1
+            # defensive fallback
+            line = self._get_line(node)
+            end = self._get_end_line(node)
+            self.if_chain_stack.append((if_id, -1))
+            self._enter_scope('<else-body>', line, 'block')
             self._visit(node)
+            self._exit_scope(end)
+            self.if_chain_stack.pop()
 
     def _visit_ElseIf(self, node: ElseIf):
         """Handle elseif clause - this is called from _visit_orelse."""
         # already handled by _visit_orelse
         pass
+
+    def _visit_Do(self, node):
+        """Handle `do ... end` block - its body is a fresh local scope."""
+        line = self._get_line(node)
+        end_line = self._get_end_line(node)
+        self._enter_scope('<do>', line, 'block')
+        body = getattr(node, 'body', None)
+        if body is not None:
+            self._visit(body)
+        self._exit_scope(end_line)
 
     def _visit_LocalAssign(self, node: LocalAssign):
         """Handle local assignment."""
@@ -1162,45 +1238,76 @@ class ASTAnalyzer:
         # Track nil-returning function assignments
         self._track_nil_source(target, value, value_repr, line, is_local)
 
+    def _find_defining_scope(self, var_name: str) -> Optional[Scope]:
+        """Find the scope that owns this variable (walks up the scope chain).
+
+        Returns None if the variable is not declared anywhere in the current
+        chain (i.e. it's a global). This matters for nil-tracking: when a
+        function parameter or outer local is reassigned inside a nested block,
+        the nil-source must be keyed under the *defining* scope, otherwise it
+        evaporates when the inner block exits and later access sites don't
+        find it.
+        """
+        scope = self.current_scope
+        while scope:
+            if var_name in scope.locals:
+                return scope
+            scope = scope.parent
+        return None
+
     def _track_nil_source(self, target: str, value: Node, value_repr: str, line: int, is_local: bool):
         """Track if a variable is assigned from a nil-returning function."""
         source_func = None
-        
+
         # Check if it's a call to a nil-returning function
         if isinstance(value, Call):
             # get the function name
             _, _, full_name = self._get_call_name(value)
             if full_name and full_name in NIL_RETURNING_FUNCTIONS:
                 source_func = full_name
-        
+
         # Check for method call (Invoke) - e.g., obj:parent()
         elif isinstance(value, Invoke):
             method_name = value.func.id if isinstance(value.func, Name) else ''
             method_pattern = f':{method_name}'
             if method_pattern in NIL_RETURNING_FUNCTIONS:
                 source_func = method_pattern
-        
+
         # Check for index access - e.g., db.actor, alife():object(id)
         elif isinstance(value, Index):
             full_name = self._node_to_string(value)
             # check direct matches like db.actor
             if full_name in NIL_RETURNING_FUNCTIONS:
                 source_func = full_name
-        
+
+        # Determine the scope under which to register/clear the nil source.
+        #  - LocalAssign (`local x = ...`) introduces a brand-new local in the
+        #    current scope, so we use current_scope.
+        #  - Plain Assign (`x = ...`) targets an already-declared variable:
+        #    walk up to find which scope owns it. If it's a global (no scope),
+        #    we skip nil-tracking entirely - the analyzer doesn't reason about
+        #    cross-call global state.
+        if is_local:
+            owning_scope = self.current_scope
+        else:
+            owning_scope = self._find_defining_scope(target)
+            if owning_scope is None:
+                return  # global write - out of scope for this analysis
+
+        key = (id(owning_scope), target)
+
         if source_func:
-            key = (id(self.current_scope), target)
             self.nil_sources[key] = NilSourceInfo(
                 var_name=target,
                 source_call=value_repr,
                 source_func=source_func,
                 assign_line=line,
-                scope=self.current_scope,
+                scope=owning_scope,
                 is_local=is_local,
                 is_guarded=False,
             )
         else:
-            # if variable is reassigned from non-nil source, remove from tracking
-            key = (id(self.current_scope), target)
+            # variable reassigned from a non-nil source - drop the tracking entry
             if key in self.nil_sources:
                 del self.nil_sources[key]
 
@@ -1401,8 +1508,7 @@ class ASTAnalyzer:
                 scope=self.current_scope,
                 in_loop=self.loop_depth > 0,
                 loop_depth=self.loop_depth,
-                parent_if_node=self.current_if_chain,
-                branch_index=self.current_branch_index,
+                if_chain_path=tuple(self.if_chain_stack),
             ))
             
             # Track RegisterScriptCallback for unused variable/function detection
@@ -1430,6 +1536,14 @@ class ASTAnalyzer:
                     in_per_frame_callback=in_per_frame,
                 ))
 
+        # the Index that names the function being called is *not* a standalone
+        # property read - record it under the Call we just emitted, not again
+        # via _visit_Index. This affects only the outermost Index attached to
+        # node.func; nested Indexes (the `a.b` in `a.b.c()`) are still real
+        # property reads and must be recorded normally.
+        if isinstance(node.func, Index):
+            self._suppress_indexes.add(id(node.func))
+
         # visit children
         self._visit(node.func)
         for arg in node.args:
@@ -1454,12 +1568,17 @@ class ASTAnalyzer:
             scope=self.current_scope,
             in_loop=self.loop_depth > 0,
             loop_depth=self.loop_depth,
-            parent_if_node=self.current_if_chain,
-            branch_index=self.current_branch_index,
+            if_chain_path=tuple(self.if_chain_stack),
         ))
-        
+
         # Check for potential nil access
         self._check_nil_access(node.source, source, full_name, line, 'method')
+
+        # source of an invoke (e.g. `db.actor` in `db.actor:method()`) is the
+        # receiver - the Invoke itself records the full `db.actor:method`
+        # signature, so don't double-count `db.actor` as a standalone read.
+        if isinstance(node.source, Index):
+            self._suppress_indexes.add(id(node.source))
 
         self._visit(node.source)
         for arg in node.args:
@@ -1490,7 +1609,43 @@ class ASTAnalyzer:
     # visitor pass-through for other nodes
     def _visit_Index(self, node: Index):
         self._visit(node.value)
-        self._visit(node.idx)
+        # Distinguish bracket vs. dot notation. For dot access (t.field), the
+        # idx is a synthetic Name representing a field literal - visiting it
+        # would falsely register the field name as a variable read and hide
+        # genuinely-unused locals that happen to share the field name.
+        # For bracket access (t[expr]), idx is a real expression that must be
+        # visited (it can read locals: t[my_var], t[foo() + 1], etc.).
+        idx_token = getattr(node.idx, 'first_token', None)
+        is_bracket = idx_token is not None and str(idx_token) != 'None'
+        if is_bracket:
+            self._visit(node.idx)
+
+        # Record property reads for repeated-access caching (e.g. `db.actor`).
+        # Only single-level dot accesses where both sides are plain Names -
+        # those are the only shape `_edit_repeated_calls` knows how to cache
+        # as `local x = base.field`.
+        if id(node) in self._suppress_indexes:
+            return
+        if is_bracket:
+            return
+        if not isinstance(node.value, Name) or not isinstance(node.idx, Name):
+            return
+
+        full_name = f"{node.value.id}.{node.idx.id}"
+        if full_name not in EXPENSIVE_INDEXES:
+            return
+
+        self.indexes.append(IndexInfo(
+            full_name=full_name,
+            module=node.value.id,
+            func=node.idx.id,
+            line=self._get_line(node),
+            node=node,
+            scope=self.current_scope,
+            in_loop=self.loop_depth > 0,
+            loop_depth=self.loop_depth,
+            if_chain_path=tuple(self.if_chain_stack),
+        ))
 
     def _visit_Table(self, node: Table):
         for field in node.fields:
@@ -1627,6 +1782,10 @@ class ASTAnalyzer:
         self._analyze_table_insert()
         self._analyze_deprecated_funcs()
         self._analyze_math_pow()
+        self._analyze_pow_operator()
+        self._analyze_string_literal_concat()
+        self._analyze_string_find_plain()
+        self._analyze_redundant_not_eq()
         self._analyze_uncached_globals()
         self._analyze_repeated_calls_in_scope()
         self._analyze_string_concat_in_loop()
@@ -1742,38 +1901,247 @@ class ASTAnalyzer:
     def _is_simple_expr(self, node: Node) -> bool:
         """Check if node is a simple expression (safe to repeat)."""
         return isinstance(node, (Name, Number))
-    
-    def _count_calls_branch_aware(self, calls: List[CallInfo]) -> int:
-        """
-        Count function calls with branch awareness.
-        
-        In mutually exclusive if/elseif/else chains, only count the max calls
-        in any single branch (not the sum across all branches).
 
-        Standard count: 3 uses
-        Branch-aware count: max(1, 2) = 2 uses (only one branch executes)
+    def _analyze_string_literal_concat(self):
+        """Find `"a" .. "b" .. "c"` chains where every leaf is a String literal.
+
+        These can be combined at compile time into a single string literal,
+        eliminating the runtime concat allocation. Walk the AST top-down: when
+        we hit a Concat whose entire subtree is all-Strings, emit a finding
+        for it and *don't* recurse into the children (their Concats are
+        subsumed by the outer one we're rewriting).
         """
-        # group calls by if-chain (use id(node) as key since nodes aren't hashable)
-        if_chains: Dict[Optional[int], Dict[int, List[CallInfo]]] = defaultdict(lambda: defaultdict(list))
-        calls_outside_if = []
-        
-        for call in calls:
-            if call.parent_if_node is not None:
-                # in an if-chain - group by (if_node_id, branch_index)
-                if_chains[id(call.parent_if_node)][call.branch_index].append(call)
+        if not getattr(self, '_ast_tree', None):
+            return
+
+        def all_string_leaves(node, out):
+            """Return True iff every leaf of this Concat tree is a String."""
+            if isinstance(node, Concat):
+                return all_string_leaves(node.left, out) and all_string_leaves(node.right, out)
+            if isinstance(node, String):
+                out.append(node)
+                return True
+            return False
+
+        def walk(node):
+            if isinstance(node, Concat):
+                leaves = []
+                if all_string_leaves(node, leaves) and len(leaves) >= 2:
+                    self._emit_string_literal_concat_finding(node, leaves)
+                    return  # children subsumed - don't recurse
+            for child in self._iter_children(node):
+                walk(child)
+
+        walk(self._ast_tree)
+
+    def _emit_string_literal_concat_finding(self, concat_node, leaves):
+        """Emit a finding for an all-literal Concat tree.
+
+        Stores a list of (start, end) spans for each String leaf along with
+        the decoded text. The transformer reuses the source text of the
+        first leaf as the new literal, splicing in the combined contents.
+        """
+        # decode each String into the concatenated value. luaparser keeps
+        # the decoded form on `.s` (without quotes/escape processing of the
+        # source - bytes/str depending on encoding).
+        parts = []
+        for leaf in leaves:
+            s = leaf.s
+            if isinstance(s, bytes):
+                s = s.decode('utf-8', errors='replace')
+            parts.append(s)
+        combined_value = ''.join(parts)
+
+        line = self._get_line(concat_node)
+        # produce a Lua literal for the combined value. Use _node_to_string
+        # which already escapes properly.
+        # Build a synthetic String AST node would be overkill; just call
+        # the same escape routine indirectly by constructing a fake node.
+        # Easiest: do the escape inline (mirrors _node_to_string).
+        escaped = combined_value.replace('\\', '\\\\')
+        escaped = escaped.replace('\a', '\\a')
+        escaped = escaped.replace('\b', '\\b')
+        escaped = escaped.replace('\f', '\\f')
+        escaped = escaped.replace('\n', '\\n')
+        escaped = escaped.replace('\r', '\\r')
+        escaped = escaped.replace('\t', '\\t')
+        escaped = escaped.replace('\v', '\\v')
+        escaped = escaped.replace('\0', '\\0')
+        if '"' in escaped and "'" not in escaped:
+            escaped_lit = "'" + escaped.replace("'", "\\'") + "'"
+        else:
+            escaped_lit = '"' + escaped.replace('"', '\\"') + '"'
+
+        self.findings.append(Finding(
+            pattern_name='string_literal_concat',
+            severity='GREEN',
+            line_num=line,
+            message=f'fold {len(leaves)} string literals into one',
+            details={
+                'parts_count': len(leaves),
+                'combined': escaped_lit,
+                'node': concat_node,
+            },
+            source_line=self._get_source_line(line),
+        ))
+
+    # Lua-pattern metacharacters. If a needle contains none of these, it's a
+    # plain text search and `string.find(s, needle, 1, true)` is much faster
+    # than the default pattern interpretation.
+    _LUA_PATTERN_META = frozenset('^$().%[]*+-?')
+
+    def _analyze_string_find_plain(self):
+        """Find `string.find(s, "literal", ...)` calls where the needle is a
+        plain string (no pattern metacharacters). Adding `, 1, true` (or
+        `, true` if `init` is already given) skips pattern compilation. Only
+        rewrite the 2-arg and 3-arg forms - with 4+ args the user has
+        already supplied a `plain` flag explicitly.
+        """
+        for call in self.calls:
+            if call.full_name != 'string.find':
+                continue
+            n_args = len(call.args)
+            if n_args < 2 or n_args > 3:
+                continue
+            needle = call.args[1]
+            if not isinstance(needle, String):
+                continue
+            s = needle.s
+            if isinstance(s, bytes):
+                s = s.decode('utf-8', errors='replace')
+            if any(ch in self._LUA_PATTERN_META for ch in s):
+                continue
+
+            self.findings.append(Finding(
+                pattern_name='string_find_plain',
+                severity='GREEN',
+                line_num=call.line,
+                message=f'string.find with plain literal "{s[:30]}" - add plain=true',
+                details={
+                    'n_args': n_args,
+                    'node': call.node,
+                },
+                source_line=self._get_source_line(call.line),
+            ))
+
+    def _analyze_redundant_not_eq(self):
+        """Find `not (a == b)` / `not (a ~= b)` and rewrite to `a ~= b` / `a == b`.
+
+        Pure boolean identity - works for any operand types Lua supports
+        (no NaN trap like comparison operators have, since `==` already
+        handles NaN consistently).
+
+        Skips patterns where the operand is anything other than EqToOp /
+        NotEqToOp (e.g. `not (a < b)` is *not* equivalent to `a >= b` for
+        floats with NaN, so we leave inequalities alone).
+        """
+        if not getattr(self, '_ast_tree', None):
+            return
+        for node in ast.walk(self._ast_tree):
+            if not isinstance(node, ULNotOp):
+                continue
+            op = node.operand
+            if isinstance(op, EqToOp):
+                new_op = '~='
+                shape = '== '
+            elif isinstance(op, NotEqToOp):
+                new_op = '=='
+                shape = '~= '
             else:
-                # not in any if statement
-                calls_outside_if.append(call)
-        
-        # count: calls outside if + max per if-chain
-        total = len(calls_outside_if)
-        
-        for if_node_id, branches in if_chains.items():
-            # take max calls across all branches in this if-chain
-            max_in_chain = max(len(branch_calls) for branch_calls in branches.values())
-            total += max_in_chain
-        
-        return total
+                continue
+
+            self.findings.append(Finding(
+                pattern_name='redundant_not_eq',
+                severity='GREEN',
+                line_num=self._get_line(node),
+                message=f'not (a {shape.strip()} b) -> a {new_op} b',
+                details={
+                    'new_op': new_op,
+                    'left_node': op.left,
+                    'right_node': op.right,
+                    'outer_node': node,
+                },
+                source_line=self._get_source_line(self._get_line(node)),
+            ))
+
+    def _analyze_pow_operator(self):
+        """Find `x ^ 2` / `x ^ 3` patterns rewriteable to `x*x` / `x*x*x`.
+
+        In LuaJIT 2.0 the `^` operator with an integer exponent dispatches
+        through a generic pow VM helper, while `x*x` compiles to a single
+        MUL bytecode. Same shape as the math.pow optimization, but the
+        operator form was previously not detected.
+        """
+        if not getattr(self, '_ast_tree', None):
+            return
+        for node in ast.walk(self._ast_tree):
+            if not isinstance(node, ExpoOp):
+                continue
+            right = node.right
+            if not isinstance(right, Number):
+                continue
+            exp = right.n
+            if exp not in (2, 3) or not self._is_simple_expr(node.left):
+                continue
+            base = self._node_to_string(node.left)
+            replacement = '*'.join([base] * int(exp))
+            full_match = f'{base}^{int(exp)}'
+            self.findings.append(Finding(
+                pattern_name='pow_op_simple',
+                severity='GREEN',
+                line_num=self._get_line(node),
+                message=f'{full_match} -> {replacement}',
+                details={
+                    'base': base,
+                    'exponent': int(exp),
+                    'replacement': replacement,
+                    'full_match': full_match,
+                    'node': node,
+                },
+                source_line=self._get_source_line(self._get_line(node)),
+            ))
+    
+    def _count_calls_branch_aware(self, calls: List) -> int:
+        """Maximum number of calls executable on any single control-flow path.
+
+        Each item carries its full ancestor `if_chain_path` (sequence of
+        (if_id, branch_index) tuples). The algorithm walks that tree depth by
+        depth: at each level, items whose path ends here count directly, and
+        items whose path reaches deeper are partitioned by next-step
+        (if_id, branch). For each if-chain encountered we sum (across the
+        chain) the *max* across its branches - only one branch executes. The
+        recursion handles arbitrarily nested if-chains correctly.
+        """
+
+        def count_at(items, depth: int) -> int:
+            if not items:
+                return 0
+
+            direct = 0
+            # if_id -> branch_idx -> list of items still descending
+            nested: Dict[int, Dict[int, list]] = {}
+
+            for item in items:
+                path = item.if_chain_path
+                if len(path) <= depth:
+                    direct += 1
+                else:
+                    if_id, branch_idx = path[depth]
+                    chain = nested.setdefault(if_id, {})
+                    chain.setdefault(branch_idx, []).append(item)
+
+            total = direct
+            for if_id, branches in nested.items():
+                # exactly one branch of this if-chain runs - take the worst case
+                max_in_chain = 0
+                for branch_idx, branch_items in branches.items():
+                    branch_count = count_at(branch_items, depth + 1)
+                    if branch_count > max_in_chain:
+                        max_in_chain = branch_count
+                total += max_in_chain
+            return total
+
+        return count_at(calls, 0)
 
     def _analyze_uncached_globals(self):
         """Find frequently used globals that should be cached."""
@@ -1852,12 +2220,15 @@ class ASTAnalyzer:
 
     def _analyze_repeated_calls_in_scope(self):
         """Find repeated expensive calls within function scope."""
-        # expensive calls to track
+        # expensive function calls (need parens) to track
         # NOTE: time_global() is NOT included because it returns different values
         # each call (current time) - caching it breaks elapsed time calculations
         # NOTE: level.object_by_id() is NOT auto-fixed because different IDs give
         # different objects, and even same IDs can change if object is destroyed
-        expensive_calls = {'db.actor', 'alife', 'system_ini', 'game_ini', 'getFS',
+        # NOTE: `db.actor` is a *property*, not a function - it's tracked via
+        # self.indexes (see EXPENSIVE_INDEXES) and folded into the same buckets
+        # below.
+        expensive_calls = {'alife', 'system_ini', 'game_ini', 'getFS',
                            'device', 'get_console', 'get_hud', 'level.name'}
 
         # method calls that are safe to cache (immutable object properties)
@@ -1868,8 +2239,10 @@ class ASTAnalyzer:
         # - :story_id() returns m_story_id set once from config (xrServer_Objects_ALife.cpp:375)
         cacheable_methods = {'section', 'id', 'clsid', 'story_id'}
 
-        # group by function scope
-        scope_calls: Dict[Scope, Dict[str, List[CallInfo]]] = defaultdict(lambda: defaultdict(list))
+        # group by function scope. Both CallInfo and IndexInfo carry the same
+        # set of fields the downstream code depends on (line, node, scope,
+        # parent_if_node, branch_index), so we can mix them in one bucket.
+        scope_calls: Dict[Scope, Dict[str, List]] = defaultdict(lambda: defaultdict(list))
 
         for call in self.calls:
             if call.full_name in expensive_calls:
@@ -1883,6 +2256,15 @@ class ASTAnalyzer:
                 if func_scope:
                     key = f"{call.full_name}()"
                     scope_calls[func_scope][key].append(call)
+
+        # Property-style accesses (db.actor, etc.). These flow through the
+        # same bucket as calls so the threshold check, branch-aware count,
+        # and finding emission below all work uniformly.
+        for idx in self.indexes:
+            if idx.full_name in EXPENSIVE_INDEXES:
+                func_scope = self._find_function_scope(idx.scope)
+                if func_scope:
+                    scope_calls[func_scope][idx.full_name].append(idx)
 
         for func_scope, calls_by_name in scope_calls.items():
             for name, calls in calls_by_name.items():
@@ -1956,13 +2338,20 @@ class ASTAnalyzer:
                     # must be: within 3 lines, NOT inside any loop, and must be local declaration
                     empty_strings = ('""', "''", '[[]]')
                     for assign in self.assigns:
-                        if (assign.target == var and 
+                        if (assign.target == var and
                             assign.value_type == 'literal' and
                             assign.value_repr in empty_strings and
                             assign.line < loop_scope.start_line and
                             assign.line >= loop_scope.start_line - 3 and
                             not assign.in_loop and
-                            assign.is_local):
+                            assign.is_local and
+                            # SAFETY: the loop's enclosing scope must match the
+                            # init's scope. If the loop is nested deeper (e.g.
+                            # inside an `if` between init and loop), inserting
+                            # `local var = table.concat(...)` after the loop's
+                            # `end` lands in the wrong scope and breaks code
+                            # that uses the variable past that scope.
+                            loop_scope.parent is assign.scope):
                             init_line = assign.line
                             is_safe = True
                             break
@@ -2216,15 +2605,23 @@ class ASTAnalyzer:
 
     def _walk_for_false_conditions(self, node_type, dead_type: str):
         """Walk AST to find if/while with literal false conditions."""
-        
+
         def is_literal_false(node: Node) -> bool:
             """Check if node is literal false or nil."""
             return isinstance(node, (FalseExpr, Nil))
-        
+
         # single flat walk - O(n) instead of O(n²)
         for node in ast.walk(self._ast_tree):
             if isinstance(node, node_type):
                 if hasattr(node, 'test') and is_literal_false(node.test):
+                    # CRITICAL: only auto-remove `if false then ... end` when
+                    # there are no elseif/else branches. With branches, the
+                    # if-chain still has reachable code (`if false then ...
+                    # elseif cond then BAR end` - BAR runs when cond is true)
+                    # and removing the entire chain drops live behaviour.
+                    if node_type is If and getattr(node, 'orelse', None) is not None:
+                        continue
+
                     start_line = self._get_line(node)
                     end_line = self._get_end_line(node) or start_line
                     
@@ -2406,28 +2803,30 @@ class ASTAnalyzer:
         def check_condition(node, node_type: str, line: int):
             """Check a condition node."""
             is_const, is_truthy, desc = is_constant_truthy(node)
-            
+
             if not is_const:
                 return
-            
+
             # Skip "while true do" - this is intentional infinite loop pattern
             if node_type == 'while' and isinstance(node, TrueExpr):
                 return
-            
-            # Skip "if true then" in some contexts (feature flags, etc.)
-            # Actually, let's report it as it's often a leftover from debugging
-            
-            if is_truthy:
-                if node_type == 'if':
-                    msg = f'Constant condition: if {desc} (always true, else branch is dead code)'
-                else:
-                    msg = f'Constant condition: while {desc} (infinite loop)'
-                severity = 'YELLOW'
+
+            # Literal nil/false are already handled by _detect_if_false_blocks /
+            # _detect_while_false_loops (which emit dead_code_* patterns). Skipping
+            # them here avoids duplicate findings AND ensures the auto-fix path
+            # (gated on pattern.startswith('dead_code_')) actually runs for them.
+            if isinstance(node, (FalseExpr, Nil)):
+                return
+
+            # All remaining cases are "always truthy" - the body always runs and the
+            # else (if any) is dead. We do not currently auto-remove this case
+            # because removing only the else branch is a more involved AST rewrite.
+            if node_type == 'if':
+                msg = f'Constant condition: if {desc} (always true, else branch is dead code)'
             else:
-                # Always false - this is dead code
-                msg = f'Constant condition: {node_type} {desc} (always false, body is dead code)'
-                severity = 'GREEN'  # Can auto-remove
-            
+                msg = f'Constant condition: while {desc} (infinite loop)'
+            severity = 'YELLOW'
+
             self.findings.append(Finding(
                 pattern_name='constant_condition',
                 severity=severity,
@@ -2436,7 +2835,7 @@ class ASTAnalyzer:
                 details={
                     'node_type': node_type,
                     'condition_desc': desc,
-                    'is_truthy': is_truthy,
+                    'is_truthy': True,
                 },
                 source_line=self._get_source_line(line),
             ))
@@ -2545,15 +2944,32 @@ class ASTAnalyzer:
         
         for callback_info in self.per_frame_callbacks:
             scope = callback_info.scope
-            
+            scope_id = id(scope)
+
+            # `_is_descendant_of(s)` returns True iff s == scope or any ancestor
+            # of s is scope. The previous implementation only checked the call's
+            # immediate scope and its direct parent, so anything inside a nested
+            # if/loop/block (which is exactly where the cost lives) was invisible.
+            def _is_in_callback(s):
+                cur = s
+                while cur is not None:
+                    if id(cur) == scope_id:
+                        return True
+                    # stop at the next enclosing FUNCTION boundary - calls
+                    # inside nested closures belong to those closures, not us
+                    if cur is not s and cur.scope_type == 'function':
+                        return False
+                    cur = cur.parent
+                return False
+
             # gather statistics about the callback
-            calls_in_scope = [c for c in self.calls 
-                            if c.scope is scope or 
-                            (c.scope and c.scope.parent is scope)]
-            
-            # count loops
-            loop_count = sum(1 for s in self.scopes 
-                           if s.scope_type == 'loop' and s.parent is scope)
+            calls_in_scope = [c for c in self.calls if c.scope and _is_in_callback(c.scope)]
+
+            # count loops anywhere inside the callback (not just direct children)
+            loop_count = sum(
+                1 for s in self.scopes
+                if s.scope_type == 'loop' and s is not scope and _is_in_callback(s)
+            )
             
             # find expensive calls
             expensive_calls = []

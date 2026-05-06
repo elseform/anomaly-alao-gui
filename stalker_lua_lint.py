@@ -766,12 +766,30 @@ def main():
                     f"\r[{progress:5.1f}%] {completed}/{len(all_files)} | {script_path.name[:30]:<30}", end="", flush=True)
 
             try:
-                findings = analyze_file(script_path, cache_threshold=args.cache_threshold, experimental=args.experimental)
+                # honour --timeout in the single-thread fallback too - without
+                # this a single bad file can hang the whole run after a worker
+                # crash forced us off the process pool.
+                if args.timeout and args.timeout > 0:
+                    findings = analyze_file_with_timeout(
+                        script_path, args.timeout,
+                        cache_threshold=args.cache_threshold,
+                        experimental=args.experimental,
+                    )
+                else:
+                    findings = analyze_file(
+                        script_path,
+                        cache_threshold=args.cache_threshold,
+                        experimental=args.experimental,
+                    )
                 files_analyzed += 1
                 if findings:
                     files_with_issues += 1
                     for finding in findings:
                         reporter.add_finding(mod_name, script_path, finding)
+            except TimeoutError:
+                parse_errors += 1
+                if args.verbose:
+                    print(f"\n  [TIMEOUT] {script_path.name}")
             except Exception as e:
                 files_skipped += 1
                 if args.verbose:
