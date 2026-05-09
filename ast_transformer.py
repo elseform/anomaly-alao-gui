@@ -1178,6 +1178,9 @@ class ASTTransformer:
         if not globals_info or not scope:
             return
 
+        if getattr(scope, 'scope_type', None) != 'function':
+            return
+
         # collect existing locals so we don't shadow a user-defined name
         # (e.g. user already has `local mfloor = ...` somewhere in this function)
         existing_locals = self._collect_function_locals(scope)
@@ -1286,6 +1289,9 @@ class ASTTransformer:
         suggestion = details.get('suggestion', '')
 
         if not calls or not scope:
+            return
+
+        if getattr(scope, 'scope_type', None) != 'function':
             return
 
         pattern = finding.pattern_name

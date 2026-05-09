@@ -5,7 +5,7 @@ AST-based Lua code analyzer implemented with https://pypi.org/project/luaparser/
 from luaparser import ast
 from luaparser.astnodes import (
     Node, Chunk, Block,
-    Function, LocalFunction, Method,
+    Function, LocalFunction, Method, AnonymousFunction,
     Assign, LocalAssign,
     While, Repeat, Fornum, Forin,
     If, ElseIf,
@@ -792,6 +792,30 @@ class ASTAnalyzer:
 
         self.function_depth += 1
         self._enter_scope(func_name, line, 'function', is_hot)
+
+        if hasattr(node, 'args') and node.args:
+            for arg in node.args:
+                if isinstance(arg, Name):
+                    self.current_scope.locals.add(arg.id)
+
+        self._visit(node.body)
+
+        end_line = self._get_end_line(node)
+        self._exit_scope(end_line)
+        self.function_depth -= 1
+
+    def _visit_AnonymousFunction(self, node: AnonymousFunction):
+        """Handle anonymous function expression (e.g. `tbl.x = function(...) ... end`).
+
+        Without this, scope tracking never enters such bodies, so references
+        inside them (db.actor, etc.) are attributed to the enclosing module
+        scope. _edit_repeated_calls would then hoist a cache to file top,
+        where db.actor is nil at script-load time.
+        """
+        line = self._get_line(node)
+
+        self.function_depth += 1
+        self._enter_scope('<anon>', line, 'function', is_hot=False)
 
         if hasattr(node, 'args') and node.args:
             for arg in node.args:
@@ -2211,12 +2235,18 @@ class ASTAnalyzer:
                 ))
 
     def _find_function_scope(self, scope: Scope) -> Optional[Scope]:
-        """Find the enclosing function scope."""
+        """Find the enclosing function scope, or None if at module level.
+
+        Must NOT fall back to global_scope: callers use the returned scope as
+        the insertion target for cache decls, and inserting at module scope
+        captures runtime-only values (db.actor, alife()) at script-load time
+        when they are still nil.
+        """
         while scope:
             if scope.scope_type == 'function':
                 return scope
             scope = scope.parent
-        return self.global_scope
+        return None
 
     def _analyze_repeated_calls_in_scope(self):
         """Find repeated expensive calls within function scope."""
