@@ -459,6 +459,17 @@ class ASTTransformer:
 
         left_text = self.source[left_start:left_end]
         right_text = self.source[right_start:right_end]
+        # Sanity check: the extracted operand text must look like a valid
+        # Lua expression (start with `(`, identifier char, digit, string
+        # quote, or `-` for unary minus). If it starts with `[` or `]` the
+        # span resolution lost a leading base identifier - bail out rather
+        # than emit invalid Lua.
+        for txt in (left_text, right_text):
+            if not txt:
+                return
+            c = txt[0]
+            if not (c.isalnum() or c in '_("\'-{ '):
+                return
         replacement = f'{left_text} {new_op} {right_text}'
 
         # If the rewritten span begins with `(` rather than `not`, the parens
@@ -1784,8 +1795,9 @@ class ASTTransformer:
                     first_str = str(first_tok)
                     first_pos = self._parse_token_start(first_str)
                     # Token-string format: "[@idx,start:end='text',type,line:col]".
-                    # Detect a dot token by its quoted text payload.
+                    # Detect a dot/bracket token by its quoted text payload.
                     is_dot_token = "='.'" in first_str
+                    is_bracket_token = "='['" in first_str
                     if first_pos is not None:
                         if is_dot_token and first_pos > 0:
                             pos = first_pos - 1
@@ -1794,6 +1806,39 @@ class ASTTransformer:
                             while pos >= 0 and (self.source[pos].isalnum() or self.source[pos] == '_'):
                                 pos -= 1
                             start = pos + 1
+                        elif is_bracket_token and first_pos > 0:
+                            # Bracket-index Index whose own first_token is the
+                            # opening `[` rather than the base identifier
+                            # (happens when the parser puts the token on the
+                            # outer Index rather than the inner Name).
+                            # Walk back over whitespace, any chain of nested
+                            # `]...[` (multi-level bracket indexing on the
+                            # same base, e.g. `m[a][b]`), and a dotted-
+                            # identifier chain to find the base. If the base
+                            # is a paren-expression like `(a+b)[i]`, give up
+                            # and return None so the caller skips the edit.
+                            pos = first_pos - 1
+                            while pos >= 0 and self.source[pos] in ' \t':
+                                pos -= 1
+                            while pos >= 0 and self.source[pos] == ']':
+                                depth = 1
+                                pos -= 1
+                                while pos >= 0 and depth > 0:
+                                    if self.source[pos] == ']':
+                                        depth += 1
+                                    elif self.source[pos] == '[':
+                                        depth -= 1
+                                    pos -= 1
+                                while pos >= 0 and self.source[pos] in ' \t':
+                                    pos -= 1
+                            if pos >= 0 and (self.source[pos].isalnum() or self.source[pos] == '_'):
+                                while pos >= 0 and (self.source[pos].isalnum() or self.source[pos] in '_.'):
+                                    pos -= 1
+                                start = pos + 1
+                            else:
+                                # base is something we can't safely reconstruct
+                                # (paren-expression, function-call result, ...)
+                                start = None
                         else:
                             # first_token IS the base name - use it directly
                             start = first_pos
