@@ -20,6 +20,17 @@ class SourceEdit:
     end_char: int        # end character offset (exclusive)
     replacement: str     # replacement text
     priority: int = 0    # higher priority edits applied first
+    # Optional grouping: links an insertion (e.g. `local tostr = tostring`) to
+    # the replacement edits it enables (e.g. tostring -> tostr at call sites).
+    # If all linked replacements get rejected (because they overlap a higher-
+    # priority edit such as a debug-statement comment-out), the insertion is
+    # dropped too -- otherwise we'd leave a dead `local X = ...` declaration
+    # with no callers.
+    group_id: Optional[int] = None
+    # When set on an insertion, marks it as an "enabler" that should be dropped
+    # if its group has no surviving replacements. Replacements in the same
+    # group leave this empty.
+    is_enabler: bool = False
 
 
 class ASTTransformer:
@@ -29,6 +40,7 @@ class ASTTransformer:
         self.source: str = ""
         self.edits: List[SourceEdit] = []
         self.file_path: Optional[Path] = None
+        self._next_group_id: int = 1
         self.analyzer: Optional[ASTAnalyzer] = None
         self._line_offsets: List[int] = []  # cached line start offsets
 
@@ -55,6 +67,7 @@ class ASTTransformer:
         """
         self.file_path = file_path
         self.edits = []
+        self._next_group_id = 1
         self.experimental = experimental
         self.fix_nil = fix_nil
         self.remove_dead_code = remove_dead_code
@@ -1209,49 +1222,97 @@ class ASTTransformer:
         if not cache_lines:
             return
 
-        # find insertion point - after function definition line
-        # but handle multi-line function definitions: function name(\n  arg1,\n  arg2)
-        func_body_start_line = scope.start_line
-        
-        func_decl_start, func_decl_end = self._get_line_span(scope.start_line)
-        if func_decl_start is not None:
-            func_decl_text = self.source[func_decl_start:func_decl_end]
-            # check if function definition has unclosed paren (multi-line params)
-            open_parens = func_decl_text.count('(')
-            close_parens = func_decl_text.count(')')
-            
-            if open_parens > close_parens:
-                # multi-line function definition - find closing paren
-                paren_depth = open_parens - close_parens
-                for search_line in range(scope.start_line + 1, scope.start_line + 30):  # reasonable limit
-                    search_start, search_end = self._get_line_span(search_line)
-                    if search_start is None:
-                        break
-                    search_text = self.source[search_start:search_end]
-                    paren_depth += search_text.count('(') - search_text.count(')')
-                    if paren_depth <= 0:
-                        # found the closing paren - insert after this line
-                        func_body_start_line = search_line
-                        break
-        
-        insert_pos = self._get_line_end(func_body_start_line)
-        if insert_pos is None:
-            return
+        # Preferred path: use the function literal's AST node to locate the body's
+        # actual start. Required for anonymous functions passed as call arguments
+        # (e.g. `CreateTimeEvent(..., function() ... end)`) where naive paren-
+        # counting on the declaration line confuses the surrounding call's open
+        # paren with the function's own params, and would otherwise insert the
+        # cache decl AFTER the closure -- outside the closure's scope, so the
+        # cache name is unresolved when the closure runs.
+        insert_pos: Optional[int] = None
+        indent: Optional[str] = None
 
-        # get indentation from the actual function body (line after params)
-        indent = self._get_indent_at_line(func_body_start_line + 1)
-        if not indent:
-            indent = self._detect_indent_unit()
+        scope_node = getattr(scope, 'node', None)
+        if scope_node is not None:
+            body = getattr(scope_node, 'body', None)
+            first_token = getattr(body, 'first_token', None) if body is not None else None
+            if first_token is not None:
+                body_start = self._parse_token_start(str(first_token))
+                if body_start is not None:
+                    line_start = self.source.rfind('\n', 0, body_start) + 1
+                    leading = self.source[line_start:body_start]
+                    if leading.strip() == '':
+                        # body's first token is at the start of its own line
+                        # (after indentation). Insert cache lines BEFORE this line.
+                        insert_pos = line_start
+                        indent = leading
 
-        # build cache block
-        cache_block = '\n' + '\n'.join(f'{indent}{line}' for line in cache_lines)
+        # Group the cache insertion with its replacement edits so the post-
+        # filtering pass can drop the insertion if every replacement gets
+        # rejected (e.g. all call sites are inside a debug_log that --fix-debug
+        # comments out; without this, we'd leave dead `local X = ...` lines).
+        gid = self._next_group_id
+        self._next_group_id += 1
 
-        self.edits.append(SourceEdit(
-            start_char=insert_pos,
-            end_char=insert_pos,
-            replacement=cache_block,
-            priority=100,
-        ))
+        if insert_pos is not None:
+            # build cache block as full lines, terminated by newline so the
+            # next line (body's original first statement) stays on its own line.
+            cache_block = ''.join(f'{indent}{line}\n' for line in cache_lines)
+
+            self.edits.append(SourceEdit(
+                start_char=insert_pos,
+                end_char=insert_pos,
+                replacement=cache_block,
+                priority=100,
+                group_id=gid,
+                is_enabler=True,
+            ))
+        else:
+            # Fallback: legacy paren-counting on the declaration line. Used when
+            # the AST node isn't available or the body starts mid-line (e.g.
+            # single-line `function(...) body end`). Skipping is safer than
+            # inserting at the wrong scope.
+            func_body_start_line = scope.start_line
+
+            func_decl_start, func_decl_end = self._get_line_span(scope.start_line)
+            if func_decl_start is not None:
+                func_decl_text = self.source[func_decl_start:func_decl_end]
+                # check if function definition has unclosed paren (multi-line params)
+                open_parens = func_decl_text.count('(')
+                close_parens = func_decl_text.count(')')
+
+                if open_parens > close_parens:
+                    # multi-line function definition - find closing paren
+                    paren_depth = open_parens - close_parens
+                    for search_line in range(scope.start_line + 1, scope.start_line + 30):  # reasonable limit
+                        search_start, search_end = self._get_line_span(search_line)
+                        if search_start is None:
+                            break
+                        search_text = self.source[search_start:search_end]
+                        paren_depth += search_text.count('(') - search_text.count(')')
+                        if paren_depth <= 0:
+                            # found the closing paren - insert after this line
+                            func_body_start_line = search_line
+                            break
+
+            fallback_pos = self._get_line_end(func_body_start_line)
+            if fallback_pos is None:
+                return
+
+            fallback_indent = self._get_indent_at_line(func_body_start_line + 1)
+            if not fallback_indent:
+                fallback_indent = self._detect_indent_unit()
+
+            cache_block = '\n' + '\n'.join(f'{fallback_indent}{line}' for line in cache_lines)
+
+            self.edits.append(SourceEdit(
+                start_char=fallback_pos,
+                end_char=fallback_pos,
+                replacement=cache_block,
+                priority=100,
+                group_id=gid,
+                is_enabler=True,
+            ))
 
         # replace usages using AST node positions
         for name, calls in globals_info.items():
@@ -1279,6 +1340,7 @@ class ASTTransformer:
                     start_char=start,
                     end_char=end,
                     replacement=new_name,
+                    group_id=gid,
                 ))
 
     def _edit_repeated_calls(self, finding: Finding):
@@ -2166,6 +2228,19 @@ class ASTTransformer:
                     inside_replacement = True
             if not inside_replacement:
                 admitted_ins.append(edit)
+
+        # Pass 3: drop "enabler" insertions whose group has no surviving
+        # replacement. This is how `local tostr = tostring` style cache decls
+        # disappear when --fix-debug comments out every call site that would
+        # have referenced them - the cache decl would otherwise sit as a dead
+        # local with no callers.
+        groups_with_repl: Set[int] = {
+            e.group_id for e in admitted_repl if e.group_id is not None
+        }
+        admitted_ins = [
+            e for e in admitted_ins
+            if not (e.is_enabler and e.group_id is not None and e.group_id not in groups_with_repl)
+        ]
 
         # Apply end-to-start so earlier positions stay valid.
         admitted = admitted_repl + admitted_ins

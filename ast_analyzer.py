@@ -204,6 +204,12 @@ class Scope:
     scope_type: str = 'block'  # 'function', 'loop', 'block'
     is_hot_callback: bool = False
 
+    # for function scopes: the AST node (Function/LocalFunction/Method/AnonymousFunction).
+    # used by ast_transformer to locate the function body's actual start position
+    # when inserting cache declarations, instead of fragile paren-counting on the
+    # declaration line (which breaks for anonymous functions passed as call args, as an examply).
+    node: Optional[Any] = None
+
     # variables declared in this scope
     locals: Set[str] = field(default_factory=set)
 
@@ -643,7 +649,7 @@ class ASTAnalyzer:
 
         return None, "", ""
 
-    def _enter_scope(self, name: str, line: int, scope_type: str = 'block', is_hot: bool = False):
+    def _enter_scope(self, name: str, line: int, scope_type: str = 'block', is_hot: bool = False, node: Optional[Any] = None):
         """Enter a new scope."""
         new_scope = Scope(
             name=name,
@@ -651,6 +657,7 @@ class ASTAnalyzer:
             parent=self.current_scope,
             scope_type=scope_type,
             is_hot_callback=is_hot or (self.current_scope and self.current_scope.is_hot_callback),
+            node=node,
         )
 
         # inherit cached globals from parent
@@ -736,8 +743,8 @@ class ASTAnalyzer:
         is_per_frame = func_name in PER_FRAME_CALLBACKS
 
         self.function_depth += 1
-        self._enter_scope(func_name, line, 'function', is_hot)
-        
+        self._enter_scope(func_name, line, 'function', is_hot, node=node)
+
         # Track per-frame callback for performance analysis
         if is_per_frame:
             self.per_frame_callbacks.append(PerFrameCallbackInfo(
@@ -791,7 +798,7 @@ class ASTAnalyzer:
         is_hot = func_name in HOT_CALLBACKS
 
         self.function_depth += 1
-        self._enter_scope(func_name, line, 'function', is_hot)
+        self._enter_scope(func_name, line, 'function', is_hot, node=node)
 
         if hasattr(node, 'args') and node.args:
             for arg in node.args:
@@ -815,7 +822,7 @@ class ASTAnalyzer:
         line = self._get_line(node)
 
         self.function_depth += 1
-        self._enter_scope('<anon>', line, 'function', is_hot=False)
+        self._enter_scope('<anon>', line, 'function', is_hot=False, node=node)
 
         if hasattr(node, 'args') and node.args:
             for arg in node.args:
@@ -841,7 +848,7 @@ class ASTAnalyzer:
         is_hot = func_name in HOT_CALLBACKS
 
         self.function_depth += 1
-        self._enter_scope(func_name, line, 'function', is_hot)
+        self._enter_scope(func_name, line, 'function', is_hot, node=node)
 
         # 'self' is implicit first param
         self.current_scope.locals.add('self')
