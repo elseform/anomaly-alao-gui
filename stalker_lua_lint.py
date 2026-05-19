@@ -67,6 +67,7 @@ import glob
 import traceback
 from pathlib import Path
 from datetime import datetime
+from typing import Optional
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, TimeoutError as FuturesTimeoutError, as_completed, BrokenExecutor
 
 from discovery import discover_mods, discover_direct
@@ -423,28 +424,38 @@ def main():
     else:
         mods = discover_mods(mods_path)
 
-    # apply exclude list if provided
-    excluded_mods = set()
+    # resolve exclude file: honour --exclude when given, otherwise auto-detect
+    # `alao_exclude.txt` next to this script. Auto-load matters for --revert,
+    # --clean-backups, and --list-backups too (those run before --fix logic),
+    # so an excluded mod's .alao-bak files stay untouched even on bulk revert.
+    exclude_path: Optional[Path] = None
     if args.exclude:
         exclude_path = Path(args.exclude)
-        if exclude_path.exists():
-            try:
-                with open(exclude_path, 'r', encoding='utf-8') as f:
-                    for line in f:
-                        line = line.strip()
-                        if line and not line.startswith('#'):
-                            excluded_mods.add(line)
-                
-                if excluded_mods:
-                    before_count = len(mods)
-                    mods = {name: scripts for name, scripts in mods.items() if name not in excluded_mods}
-                    excluded_count = before_count - len(mods)
-                    if excluded_count > 0:
-                        print(f"Excluded {excluded_count} mods from {exclude_path.name}")
-            except Exception as e:
-                print(f"Warning: Could not read exclude file: {e}")
-        else:
+        if not exclude_path.exists():
             print(f"Warning: Exclude file not found: {exclude_path}")
+            exclude_path = None
+    else:
+        default_exclude = Path(__file__).resolve().parent / 'alao_exclude.txt'
+        if default_exclude.exists():
+            exclude_path = default_exclude
+
+    excluded_mods = set()
+    if exclude_path is not None:
+        try:
+            with open(exclude_path, 'r', encoding='utf-8') as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith('#'):
+                        excluded_mods.add(line)
+
+            if excluded_mods:
+                before_count = len(mods)
+                mods = {name: scripts for name, scripts in mods.items() if name not in excluded_mods}
+                excluded_count = before_count - len(mods)
+                if excluded_count > 0:
+                    print(f"Excluded {excluded_count} mods from {exclude_path.name}")
+        except Exception as e:
+            print(f"Warning: Could not read exclude file: {e}")
 
     if not mods:
         if args.direct:
