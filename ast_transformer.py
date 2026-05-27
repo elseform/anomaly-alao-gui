@@ -13,6 +13,15 @@ from ast_analyzer import analyze_file, ASTAnalyzer, Scope
 from models import Finding
 
 
+# Lua reserved keywords. Used to distinguish a grouping paren after a keyword
+# (e.g. `if (foo())`) from a real function-call name preceding a paren
+_LUA_KEYWORDS = frozenset({
+    'and', 'break', 'do', 'else', 'elseif', 'end', 'false', 'for',
+    'function', 'goto', 'if', 'in', 'local', 'nil', 'not', 'or',
+    'repeat', 'return', 'then', 'true', 'until', 'while',
+})
+
+
 @dataclass
 class SourceEdit:
     """A source code edit with character positions."""
@@ -723,6 +732,17 @@ class ASTTransformer:
                 start_line = self.source[:start_char].count('\n') + 1
                 end_line = self.source[:end_char].count('\n') + 1
 
+                # Dont comment a statement that BINDS the debug call's result to
+                # a variable (e.g. `local tc = self:log(...)`). Commenting the
+                # line removes the declaration while later uses of the variable
+                # survive -> "attempt to use global 'tc' (a nil value)"
+                stmt_line_start, _ = self._get_line_span(start_line)
+                if stmt_line_start is not None:
+                    prefix = self.source[stmt_line_start:start_char]
+                    if re.search(r'\blocal\b', prefix) or \
+                            re.search(r'(?<![=~<>!])=(?!=)', prefix):
+                        return
+
                 # expression continuations - if prev line ends with these, call is part of expr
                 expr_continuations = [' and', ' or', '(', ',', '=', '{', '[']
 
@@ -797,6 +817,11 @@ class ASTTransformer:
 
         # skip lines with control flow outside strings/comments
         if self._has_control_flow_keyword(stripped):
+            return
+
+        # skip assignment statements - commenting them drops a binding that
+        # later code may still reference (see node-path note above)
+        if re.match(r'(local\s+)?[\w.\[\]\'"]+\s*=(?!=)', stripped):
             return
 
         indent = line[:len(line) - len(stripped)]
@@ -1437,6 +1462,14 @@ class ASTTransformer:
             # These can't be converted to valid Lua variable names
             if '[' in real_obj_name or ']' in real_obj_name:
                 return
+
+            # SAFETY CHECK: skip if the object expression itself contains a call
+            # (a method chain, e.g. obj:active_item():section()). The sanitized
+            # name would carry the '()' -> invalid identifier, and split(':')[0]
+            # mis-derives the cached value. Caching these is unsafe.
+            if '(' in sanitized_obj_name or ')' in sanitized_obj_name \
+                    or '(' in real_obj_name or ')' in real_obj_name:
+                return
             
             # generate cache variable name (always use sanitized for variable)
             if method_name == 'section':
@@ -1623,26 +1656,44 @@ class ASTTransformer:
                                 # object is nil-guarded, skip caching to preserve safety
                                 return
 
-                # check if calls span different blocks
-                # look for else/elseif/end between first and last call
+                # check if calls span different blocks. Indentation is unreliable
+                # (some scripts are mis-indented), so track block nesting by
+                # counting Lua block keywords. If the block CONTAINING the first
+                # call closes (depth drops below 0) or branches (else/elseif at
+                # depth 0) before the last call, later calls are in a different
+                # scope -> the decl can't dominate them, so hoist to func top.
                 last_call = calls[-1]
                 if last_call.line > first_call.line:
-                    first_indent = self._get_indent_at_line(first_call.line)
-                    first_indent_len = len(first_indent) if first_indent else 0
-                    
+                    depth = 0
                     for check_line in range(first_call.line + 1, last_call.line + 1):
                         cls, cle = self._get_line_span(check_line)
-                        if cls is not None:
-                            check_text = self.source[cls:cle]
-                            check_stripped = check_text.lstrip()
-                            check_indent_len = len(check_text) - len(check_stripped)
-                            
-                            # if else/elseif/end at same or shallower indent, calls are in different blocks
-                            if check_indent_len <= first_indent_len:
-                                first_word = check_stripped.split()[0] if check_stripped.split() else ''
-                                if first_word in ('else', 'elseif', 'end'):
-                                    has_branch_between_calls = True
-                                    break
+                        if cls is None:
+                            continue
+                        text = self.source[cls:cle]
+                        # strip line comment and quoted strings (keywords inside
+                        # them must not count toward block nesting)
+                        cpos = text.find('--')
+                        if cpos != -1:
+                            text = text[:cpos]
+                        text = re.sub(r'"(?:\\.|[^"\\])*"', '', text)
+                        text = re.sub(r"'(?:\\.|[^'\\])*'", '', text)
+                        words = re.findall(r'\b[a-z]+\b', text.lower())
+                        has_for_while = any(w in ('for', 'while') for w in words)
+                        opens = closes = 0
+                        branch_at_zero = False
+                        for w in words:
+                            if w in ('function', 'if', 'for', 'while', 'repeat'):
+                                opens += 1
+                            elif w == 'do' and not has_for_while:
+                                opens += 1
+                            elif w in ('end', 'until'):
+                                closes += 1
+                            elif w in ('else', 'elseif') and depth == 0:
+                                branch_at_zero = True
+                        if branch_at_zero or depth - closes < 0:
+                            has_branch_between_calls = True
+                            break
+                        depth += opens - closes
 
                 if (has_loop_before_first_call or has_branch_between_calls) and last_call.line > first_call.line:
                     if is_method_cache:
@@ -1696,6 +1747,13 @@ class ASTTransformer:
                             indent = call_indent[:len(call_indent)//2] if len(call_indent) >= 2 else call_indent
                     else:
                         indent = self._detect_indent_unit()
+
+            # Final safety: the chosen insert_pos must be a valid statement
+            # boundary. Bail out if it lands before an elseif/else/until (would
+            # split an if-chain) or on a line continuing the previous statement
+            # (e.g. an expression broken across lines by a trailing `or`/`=`)
+            if not self._is_safe_local_insert_pos(insert_pos):
+                return
 
             self.edits.append(SourceEdit(
                 start_char=insert_pos,
@@ -1752,6 +1810,44 @@ class ASTTransformer:
             ))
 
 
+    def _is_safe_local_insert_pos(self, insert_pos: int) -> bool:
+        """True if a `local x = ...` line can be inserted at insert_pos without
+        breaking syntax. insert_pos must be a line-start offset."""
+        # line number of the insertion target (1-based)
+        ins_line = self.source.count('\n', 0, insert_pos) + 1
+
+        # the insertion line must not be a branch-continuation keyword: putting
+        # a statement before `elseif`/`else`/`until` splits the construct.
+        ls, le = self._get_line_span(ins_line)
+        if ls is not None:
+            m = re.match(r'\s*([A-Za-z]+)', self.source[ls:le])
+            if m and m.group(1) in ('elseif', 'else', 'until'):
+                return False
+
+        # the previous code line must not leave the statement unterminated
+        # (expression broken across lines by a trailing operator / `=` / comma).
+        pl = ins_line - 1
+        while pl >= 1:
+            pls, ple = self._get_line_span(pl)
+            if pls is None:
+                break
+            ptext = self.source[pls:ple]
+            cpos = ptext.find('--')
+            if cpos != -1:
+                ptext = ptext[:cpos]
+            pstr = ptext.rstrip()
+            if pstr == '':
+                pl -= 1
+                continue
+            # trailing binary keyword (and/or/not) -> continuation
+            if re.search(r'(?:^|[^\w])(and|or|not)$', pstr):
+                return False
+            # trailing operator / open bracket / separator -> continuation
+            if pstr[-1] in '+-*/%^#<>=~,({[.':
+                return False
+            return True
+        return True
+
     # Position helpers using AST tokens
 
     def _get_node_span(self, node) -> Tuple[Optional[int], Optional[int]]:
@@ -1785,6 +1881,13 @@ class ASTTransformer:
                         pos -= 1
                     found_identifier = pos != id_end
                     start = pos + 1
+
+                    # A Lua keyword before the paren (e.g. `if (foo())`) is NOT a
+                    # call name - it's a grouping paren after the keyword. Treat
+                    # it as "no identifier" so the wrap branch below returns just
+                    # the parenthesised expression, not `if (...)`
+                    if found_identifier and self.source[start:end_of_name] in _LUA_KEYWORDS:
+                        found_identifier = False
 
                     # end is the closing paren
                     last = getattr(node, 'last_token', None)
