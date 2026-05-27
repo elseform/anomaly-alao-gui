@@ -2224,7 +2224,7 @@ class ASTTransformer:
             inside_replacement = False
             if covered_starts:
                 i = bisect_right(covered_starts, s) - 1
-                if i >= 0 and covered_starts[i] <= s < covered_ends[i]:
+                if i >= 0 and covered_starts[i] < s < covered_ends[i]:
                     inside_replacement = True
             if not inside_replacement:
                 admitted_ins.append(edit)
