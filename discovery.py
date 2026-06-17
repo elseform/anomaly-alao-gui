@@ -7,7 +7,7 @@ Handles the standard MO2 structure:
 """
 
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Set, Tuple
 
 
 def discover_mods(root_path: Path) -> Dict[str, List[Path]]:
@@ -61,6 +61,62 @@ def discover_mods(root_path: Path) -> Dict[str, List[Path]]:
                             mods[mod_name] = scripts
 
     return mods
+
+
+def read_active_modlist(modlist_path: Path) -> Set[str]:
+    """
+    Read an MO2 modlist.txt and return enabled mod names.
+
+    MO2 marks enabled entries with '+', disabled entries with '-', and can use
+    '*' for force-enabled/unmanaged entries. Plain names are accepted too so a
+    simple one-mod-name-per-line file can be used for testing or custom lists.
+    """
+    active_mods = set()
+    modlist_path = Path(modlist_path)
+
+    for raw_line in modlist_path.read_text(encoding='utf-8-sig', errors='ignore').splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith('#'):
+            continue
+
+        marker = line[0]
+        if marker == '-':
+            continue
+        if marker in ('+', '*'):
+            name = line[1:].strip()
+        else:
+            name = line
+
+        if name:
+            active_mods.add(name)
+
+    return active_mods
+
+
+def filter_mods_by_modlist(
+    mods: Dict[str, List[Path]],
+    active_mods: Set[str],
+) -> Tuple[Dict[str, List[Path]], Set[str]]:
+    """
+    Filter discovered mods to the enabled names from a modlist.
+
+    Nested discoveries are named as "parent/child"; those are matched against
+    both the full discovered name and the top-level parent folder.
+    Returns the filtered mods and active names that did not match anything.
+    """
+    filtered = {}
+    matched = set()
+
+    for mod_name, scripts in mods.items():
+        top_level_name = mod_name.split('/', 1)[0]
+        if mod_name in active_mods:
+            filtered[mod_name] = scripts
+            matched.add(mod_name)
+        elif top_level_name in active_mods:
+            filtered[mod_name] = scripts
+            matched.add(top_level_name)
+
+    return filtered, active_mods - matched
 
 
 def find_scripts(scripts_dir: Path) -> List[Path]:

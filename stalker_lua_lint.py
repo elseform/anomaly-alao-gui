@@ -2,6 +2,8 @@
 ALAO main orchestrator script (entry point).
 Written by: Abraham (Priler)
 
+GUI + extended MO2 options by elseform.
+
 AST bases Lua parser & analyzer for S.T.A.L.K.E.R. Anomaly mods.
 Should help to automatically prevent common scripts optimization issues.
 
@@ -26,6 +28,7 @@ Options:
                        (default: scripts-backup-<date>.zip)
     --revert          Restore all .alao-bak backup files (undo ALAO fixes)
     --report [file]   Generate a comprehensive report (supports .txt, .html, .json)
+    --modlist [file]  Use an MO2 modlist.txt and analyze enabled mods only
 
     # SAFETY (auto-backup on first fix run)
     When any --fix* flag is used and no scripts-backup-*.zip exists in the mods folder,
@@ -70,7 +73,7 @@ from datetime import datetime
 from typing import Optional
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, TimeoutError as FuturesTimeoutError, as_completed, BrokenExecutor
 
-from discovery import discover_mods, discover_direct
+from discovery import discover_mods, discover_direct, filter_mods_by_modlist, read_active_modlist
 from ast_analyzer import analyze_file
 from ast_transformer import transform_file
 from reporter import Reporter
@@ -279,6 +282,12 @@ def main():
         help="Generate a comprehensive report (supports .txt, .html, .json)"
     )
     parser.add_argument(
+        "--modlist",
+        type=str,
+        default=None,
+        help="Path to MO2 modlist.txt; only enabled mods are analyzed"
+    )
+    parser.add_argument(
         "--verbose", "-v",
         action="store_true",
         help="Show detailed output"
@@ -423,6 +432,35 @@ def main():
         mods = discover_direct(mods_path)
     else:
         mods = discover_mods(mods_path)
+
+    if args.modlist:
+        if args.direct:
+            print("Warning: --modlist is ignored in direct mode.")
+        else:
+            modlist_path = Path(args.modlist)
+            if not modlist_path.exists():
+                print(f"Error: Modlist file does not exist: {modlist_path}")
+                sys.exit(1)
+
+            try:
+                active_mods = read_active_modlist(modlist_path)
+            except Exception as e:
+                print(f"Error: Could not read modlist file: {e}")
+                sys.exit(1)
+
+            if not active_mods:
+                print(f"Error: No enabled mods found in modlist: {modlist_path}")
+                sys.exit(1)
+
+            before_count = len(mods)
+            mods, unmatched_active_mods = filter_mods_by_modlist(mods, active_mods)
+            filtered_count = before_count - len(mods)
+            print(
+                f"Using active modlist: {modlist_path.name} "
+                f"({len(active_mods)} enabled, {filtered_count} inactive/non-matching mods skipped)"
+            )
+            if unmatched_active_mods and args.verbose:
+                print(f"Active modlist entries without scripts: {len(unmatched_active_mods)}")
 
     # resolve exclude file: honour --exclude when given, otherwise auto-detect
     # `alao_exclude.txt` next to this script. Auto-load matters for --revert,
